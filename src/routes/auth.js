@@ -1,0 +1,153 @@
+const express = require("express");
+const bcrypt = require("bcryptjs");
+const crypto = require("crypto");
+const jwt = require("jsonwebtoken");
+const rateLimit = require("express-rate-limit");
+const { z } = require("zod");
+const config = require("../config");
+const { User } = require("../models");
+const { wrap, validate, authenticate, requirePerm } = require("../middleware/common");
+const { permissionsFor, P } = require("../domain/permissions");
+const { BusinessError } = require("../domain/errors");
+const { AuditLog } = require("../models");
+
+const esc = (t) => String(t).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const loginLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: Number(process.env.LOGIN_RATE_LIMIT || 30), standardHeaders: true, legacyHeaders: false, message: { message: "Too many login attempts. Try again later." } });
+
+const safeEq = (a, b) => { const A = Buffer.from(String(a)), B = Buffer.from(String(b)); return A.length === B.length && crypto.timingSafeEqual(A, B); };
+const strongPw = z.string().min(8, "Password must be at least 8 characters").max(128).regex(/[A-Za-z]/, "Password must contain a letter").regex(/\d/, "Password must contain a digit");
+
+async function verifyPassword(user, password) {
+  if (user.passwordHash) return bcrypt.compare(password, user.passwordHash);
+  if (user.password && safeEq(user.password, password)) { // legacy plaintext: upgrade transparently
+    user.passwordHash = await bcrypt.hash(password, config.bcryptRounds);
+    user.password = undefined;
+    await user.save();
+    return true;
+  }
+  return false;
+}
+const sign = (u) => jwt.sign({ id: String(u._id), v: u.tokenVersion || 0 }, config.jwtSecret, { expiresIn: config.jwtExpiresIn });
+
+const loginBody = z.object({ email: z.string().trim().min(1).max(200), password: z.string().min(1).max(200), otp: z.string().max(12).optional() });
+const totp = require("../domain/totp");
+const QR = require("qrcode");
+const loginHandler = wrap(async (req, res) => {
+  const { email, password } = req.body;
+  const SENSITIVE = "+password +passwordHash +totpSecret";
+  let user = await User.findOne({ emailId: email }).select(SENSITIVE);
+  if (!user) user = await User.findOne({ emailId: new RegExp(`^${esc(email)}$`, "i") }).select(SENSITIVE);
+  // same message for unknown user / wrong password: no account enumeration
+  if (user && user.lockUntil && user.lockUntil > new Date()) return res.status(423).json({ message: `Account temporarily locked after repeated failed sign-ins. Try again in ${Math.ceil((user.lockUntil - Date.now()) / 60000)} minute(s).` });
+  if (!user || user.active === false || !(await verifyPassword(user, password))) {
+    if (user && user.active !== false) { // count failures per account (the IP limiter alone does not stop a slow guessing attack)
+      const n = (user.failedLogins || 0) + 1;
+      await User.updateOne({ _id: user._id }, n >= config.maxFailedLogins ? { $set: { failedLogins: 0, lockUntil: new Date(Date.now() + config.lockMinutes * 60000) } } : { $set: { failedLogins: n } });
+    }
+    return res.status(401).json({ message: "Invalid email or password" });
+  }
+  if (user.totpEnabled) {
+    if (!req.body.otp) return res.status(401).json({ message: "Authentication code required", otpRequired: true });
+    if (!totp.verify(user.totpSecret, req.body.otp)) return res.status(401).json({ message: "Invalid authentication code", otpRequired: true });
+  }
+  user.lastLogin = new Date(); user.failedLogins = 0; user.lockUntil = undefined;
+  await user.save();
+  const token = sign(user);
+  // `message`, `role`, `_id`, `token` keep the legacy frontend contract.
+  res.json({ message: user.name, name: user.name, role: user.role, _id: user._id, token, permissions: await permissionsFor(user.role), mustChangePassword: !!user.mustChangePassword });
+});
+
+const router = express.Router();
+router.post("/login", loginLimiter, validate(loginBody), loginHandler);
+
+const authed = express.Router();
+authed.get("/me", wrap(async (req, res) => res.json({ ...req.user, permissions: await permissionsFor(req.user.role) })));
+authed.post("/change-password", validate(z.object({ currentPassword: z.string(), newPassword: strongPw })), wrap(async (req, res) => {
+  const user = await User.findById(req.user.id).select("+password +passwordHash");
+  if (!(await verifyPassword(user, req.body.currentPassword))) return res.status(401).json({ message: "Current password is incorrect" });
+  user.passwordHash = await bcrypt.hash(req.body.newPassword, config.bcryptRounds);
+  user.password = undefined; user.mustChangePassword = false; user.tokenVersion = (user.tokenVersion || 0) + 1; // signs out every other session
+  await user.save();
+  await AuditLog.create({ user: user._id, userName: user.name, role: user.role, action: "PASSWORD_CHANGED", entityType: "User", entityId: String(user._id), entityLabel: user.emailId });
+  res.json({ message: "Password updated. Please sign in again." });
+}));
+authed.post("/logout-all", wrap(async (req, res) => { await User.updateOne({ _id: req.user.id }, { $inc: { tokenVersion: 1 } }); res.json({ message: "All sessions signed out." }); }));
+authed.get("/2fa", wrap(async (req, res) => { const u = await User.findById(req.user.id).lean(); res.json({ enabled: !!u.totpEnabled }); }));
+authed.post("/2fa/setup", wrap(async (req, res) => {
+  const u = await User.findById(req.user.id); if (u.totpEnabled) throw new BusinessError("2FA_ALREADY_ON", "Two-factor authentication is already enabled.");
+  u.totpPending = totp.newSecret(); await u.save(); const uri = totp.uri(u.totpPending, u.emailId);
+  res.json({ secret: u.totpPending, uri, qrSvg: await QR.toString(uri, { type: "svg", margin: 1 }) });
+}));
+authed.post("/2fa/enable", validate(z.object({ code: z.string().max(12) })), wrap(async (req, res) => {
+  const u = await User.findById(req.user.id).select("+totpPending"); if (!u.totpPending) throw new BusinessError("2FA_NOT_STARTED", "Start setup first.");
+  if (!totp.verify(u.totpPending, req.body.code)) throw new BusinessError("2FA_BAD_CODE", "That code is not valid. Check your phone clock and try again.", { status: 400 });
+  u.totpSecret = u.totpPending; u.totpPending = undefined; u.totpEnabled = true; await u.save();
+  await AuditLog.create({ user: u._id, userName: u.name, role: u.role, action: "2FA_ENABLED", entityType: "User", entityId: String(u._id), entityLabel: u.emailId });
+  res.json({ ok: true });
+}));
+authed.post("/2fa/disable", validate(z.object({ password: z.string(), code: z.string().max(12) })), wrap(async (req, res) => {
+  const u = await User.findById(req.user.id).select("+password +passwordHash +totpSecret");
+  if (!(await verifyPassword(u, req.body.password)) || !u.totpEnabled || !totp.verify(u.totpSecret, req.body.code)) throw new BusinessError("2FA_BAD_CODE", "Password or code is incorrect.", { status: 400 });
+  u.totpEnabled = false; u.totpSecret = undefined; await u.save();
+  await AuditLog.create({ user: u._id, userName: u.name, role: u.role, action: "2FA_DISABLED", entityType: "User", entityId: String(u._id), entityLabel: u.emailId });
+  res.json({ ok: true });
+}));
+
+// user administration (admin only, permission checked server-side)
+const roleStr = z.string().trim().min(2).max(40);
+const userCreate = z.object({ name: z.string().trim().min(1).max(100), emailId: z.string().trim().email().max(200), role: roleStr, password: strongPw });
+const userUpdate = z.object({ name: z.string().trim().min(1).max(100).optional(), emailId: z.string().trim().email().max(200).optional(), role: roleStr.optional(), active: z.boolean().optional(), password: strongPw.optional() }).strict();
+const publicUser = (u) => ({ _id: u._id, name: u.name, emailId: u.emailId, role: u.role, active: u.active !== false, lastLogin: u.lastLogin });
+
+async function activeAdminCount(excludeId) {
+  const admins = await User.find({ role: /^admin$/i, active: { $ne: false }, ...(excludeId && { _id: { $ne: excludeId } }) }).countDocuments();
+  return admins;
+}
+const adminOnly = requirePerm(P.ADMIN_USERS);
+const users = express.Router();
+users.get("/", adminOnly, wrap(async (req, res) => res.json((await User.find().sort({ name: 1 })).map(publicUser))));
+users.get("/directory", wrap(async (req, res) => res.json((await User.find({ active: { $ne: false } }).select("name role").sort({ name: 1 }).lean())))); // for handover recipient picker
+users.get("/:id", adminOnly, wrap(async (req, res) => { const u = await User.findById(req.params.id); return u ? res.json(publicUser(u)) : res.status(404).json({ message: "User not found" }); }));
+users.post("/", adminOnly, validate(userCreate), wrap(async (req, res) => {
+  const { name, emailId, role, password } = req.body;
+  if (await User.exists({ emailId: new RegExp(`^${esc(emailId)}$`, "i") })) return res.status(409).json({ message: "user already exist" });
+  const u = await User.create({ name, emailId, role, passwordHash: await bcrypt.hash(password, config.bcryptRounds) });
+  await AuditLog.create({ user: req.user.id, userName: req.user.name, role: req.user.role, action: "USER_CREATED", entityType: "User", entityId: String(u._id), entityLabel: emailId, after: { role } });
+  res.status(201).json({ message: "user registered successfully!", user: publicUser(u) });
+}));
+users.put("/:id", adminOnly, validate(userUpdate), wrap(async (req, res) => {
+  const u = await User.findById(req.params.id);
+  if (!u) return res.status(404).json({ message: "User not found" });
+  const before = publicUser(u);
+  const { password, ...rest } = req.body;
+  const demoting = (rest.role && !/^admin$/i.test(rest.role)) || rest.active === false;
+  if (demoting && /^admin$/i.test(u.role) && (await activeAdminCount(u._id)) === 0) throw new BusinessError("LAST_ADMIN", "At least one active administrator must remain.");
+  Object.assign(u, rest);
+  if (password || rest.role !== undefined || rest.active === false) u.tokenVersion = (u.tokenVersion || 0) + 1; // signs the user out everywhere
+  if (password) { u.passwordHash = await bcrypt.hash(password, config.bcryptRounds); u.password = undefined; u.failedLogins = 0; u.lockUntil = undefined; }
+  await u.save();
+  await AuditLog.create({ user: req.user.id, userName: req.user.name, role: req.user.role, action: "USER_UPDATED", entityType: "User", entityId: String(u._id), entityLabel: u.emailId, before, after: { ...publicUser(u), passwordChanged: !!password } });
+  res.json(publicUser(u));
+}));
+users.delete("/:id", adminOnly, wrap(async (req, res) => {
+  const u = await User.findById(req.params.id);
+  if (!u) return res.status(404).json({ message: "User not found" });
+  if (String(u._id) === req.user.id) throw new BusinessError("SELF_DELETE", "You cannot delete your own account.");
+  if (/^admin$/i.test(u.role) && (await activeAdminCount(u._id)) === 0) throw new BusinessError("LAST_ADMIN", "At least one active administrator must remain.");
+  await u.deleteOne();
+  await AuditLog.create({ user: req.user.id, userName: req.user.name, role: req.user.role, action: "USER_DELETED", entityType: "User", entityId: String(u._id), entityLabel: u.emailId, before: publicUser(u) });
+  res.json({ message: "User deleted" });
+}));
+
+// First-run bootstrap: only when NO users exist.
+const bootstrap = wrap(async (req, res, next) => {
+  if (req.method === "POST" && req.path === "/users" && (await User.estimatedDocumentCount()) === 0) {
+    const r = userCreate.safeParse({ ...req.body, role: "admin" });
+    if (!r.success) return res.status(400).json({ message: r.error.issues.map((i) => i.message).join("; ") });
+    const u = await require("../domain/bootstrap").createFirstAdmin(r.data);
+    if (!u) return res.status(409).json({ message: "An administrator already exists." });
+    return res.status(201).json({ message: "First administrator created", user: publicUser(u) });
+  }
+  next();
+});
+module.exports = { router, authed, users, loginHandler, loginLimiter, loginBody, bootstrap };

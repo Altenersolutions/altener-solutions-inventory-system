@@ -1,0 +1,17 @@
+name: Daily database backup
+on:
+  schedule: [{ cron: "30 20 * * *" }]   # 02:00 IST
+  workflow_dispatch: {}
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install MongoDB database tools
+        run: |
+          wget -q https://fastdl.mongodb.org/tools/db/mongodb-database-tools-ubuntu2204-x86_64-100.10.0.deb
+          sudo apt-get install -y ./mongodb-database-tools-*.deb
+      - run: ./scripts/backup.sh
+        env: { MONGO_URI: "${{ secrets.MONGO_URI }}" }
+      - uses: actions/upload-artifact@v4
+        with: { name: wms-backup, path: backups/, retention-days: 14 }
