@@ -33,10 +33,10 @@ Fill this table in once and keep it current. **Accounts must belong to the compa
 
 | Item | Value |
 |---|---|
-| GitHub repository (backend) | https://github.com/Altenersolutions/aspl-new |
-| GitHub repository (frontend) | https://app.netlify.com/projects/aspl-new-inventory/overview |
-| Render service name / URL | https://aspl-new.onrender.com |
-| Netlify site name / URL | https://aspl-new-inventory.netlify.app |
+| GitHub repository (backend) | https://github.com/Altenersolutions/aspl-wms-backend-staging |
+| GitHub repository (frontend) | https://app.netlify.com/projects/altenersolutions-inventory-system/overview |
+| Render service name / URL | https://aspl-wms-backend-staging.onrender.com |
+| Netlify site name / URL | https://altenersolutions-inventory-system.netlify.app |
 | MongoDB Atlas project / cluster | -- |
 | Company email that owns these accounts | -- |
 | Current system owner (name, role) | Saivinayak Pawar, Trainee, with "system reference: RND-7" |
