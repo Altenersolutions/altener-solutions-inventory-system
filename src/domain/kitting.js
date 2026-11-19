@@ -8,7 +8,7 @@ const { audit } = require("./audit");
 const ledger = require("./ledger");
 const { findSpecial } = require("./locations");
 const { getVehicle, getBomRevision } = require("./assembly");
-const { reservedQty } = require("./reservations");
+const { reservedQty, binQty } = require("./reservations");
 
 async function create(user, body) {
   const vehicle = await getVehicle(body.vehicle);
@@ -19,6 +19,7 @@ async function create(user, body) {
   if (openKits.length) throw new BusinessError("KIT_ALREADY_OPEN", "This vehicle already has an open kit. Issue or cancel it first.");
   const installs = await Installation.find({ vehicle: vehicle._id, active: true }).lean();
   const plan = [];
+  const plannedByItem = new Map();
   for (const bi of rev.items) {
     if (bi.optional && !body.includeOptional) continue;
     const done = installs.filter((i) => String(i.part) === String(bi.part)).reduce((t, i) => t + i.quantity, 0);
@@ -30,10 +31,12 @@ async function create(user, body) {
       if (need <= 0) break;
       const bal = await StockBalance.find({ materialItem: it._id, quantity: { $gt: 0 } }).populate("location", "type").lean();
       const inBins = bal.filter((b) => b.location.type === "BIN").reduce((t, b) => t + b.quantity, 0);
-      const free = inBins - (await reservedQty(it._id));
+      const itemId = String(it._id);
+      const free = inBins - (await reservedQty(it._id)) - (plannedByItem.get(itemId) || 0);
       if (free <= 0) continue;
       const take = Math.min(free, need);
       allocs.push({ item: it, qty: take }); need -= take; got += take;
+      plannedByItem.set(itemId, (plannedByItem.get(itemId) || 0) + take);
     }
     plan.push({ bi, allocs, reserved: got, shortage: Math.max(0, bi.requiredQuantity - done - got), required: bi.requiredQuantity - done });
   }
@@ -41,11 +44,29 @@ async function create(user, body) {
   const short = plan.some((p) => p.shortage > 0);
   if (short && !body.allowPartial) throw new BusinessError("KIT_SHORTAGE", "Not enough approved stock to complete the kit.", { details: { shortages: plan.filter((p) => p.shortage).map((p) => ({ part: p.bi.partNumber, required: p.required, available: p.reserved, shortage: p.shortage })) } });
   return atomic(async (ctx) => {
-    for (const p of plan) for (const a of p.allocs) { // two kits cannot reserve the same free units
-      await ctx.lock(MaterialItem, a.item._id);
-      const bal = await StockBalance.find({ materialItem: a.item._id, quantity: { $gt: 0 } }).populate("location", "type").lean();
-      const free = bal.filter((b) => b.location.type === "BIN").reduce((t, b) => t + b.quantity, 0) - (await reservedQty(a.item._id));
-      if (free < a.qty) throw new BusinessError("KIT_STOCK_CHANGED", "Stock was reserved or moved by someone else while the kit was being built. Please try again.", { status: 409 });
+    await ctx.lock(Vehicle, vehicle._id);
+    const freshVehicle = await Vehicle.findById(vehicle._id, null, ctx.opt).lean();
+    if (!freshVehicle || ["SCRAPPED", "FINAL_QC", "QC_APPROVED", "RELEASED", "DISPATCHED"].includes(freshVehicle.status)) {
+      throw new BusinessError("VEHICLE_CLOSED", `Vehicle ${vehicle.vehicleNumber} is no longer available for kitting.`);
+    }
+    const openKit = await Kit.findOne({ vehicle: vehicle._id, status: { $in: ["READY", "PARTIAL"] } }, null, ctx.opt).lean();
+    if (openKit) throw new BusinessError("KIT_ALREADY_OPEN", "This vehicle already has an open kit. Issue or cancel it first.");
+
+    const requestedByItem = new Map();
+    for (const p of plan) {
+      for (const allocation of p.allocs) {
+        const key = String(allocation.item._id);
+        const current = requestedByItem.get(key) || { item: allocation.item, quantity: 0 };
+        current.quantity += allocation.qty;
+        requestedByItem.set(key, current);
+      }
+    }
+    for (const { item, quantity } of requestedByItem.values()) {
+      await ctx.lock(MaterialItem, item._id);
+      const currentItem = await MaterialItem.findOne({ _id: item._id, status: MS.APPROVED, installedOn: { $in: [null, undefined] } }, null, ctx.opt).lean();
+      if (!currentItem) throw new BusinessError("KIT_STOCK_CHANGED", "Material status changed while the kit was being built. Please try again.", { status: 409 });
+      const free = await binQty(item._id, ctx.session) - await reservedQty(item._id, null, ctx.session);
+      if (free < quantity) throw new BusinessError("KIT_STOCK_CHANGED", "Stock was reserved or moved by someone else while the kit was being built. Please try again.", { status: 409 });
     }
     const kitId = await nextId("kit", "KIT", 5);
     const kit = await ctx.create(Kit, { kitId, vehicle: vehicle._id, vehicleNumber: vehicle.vehicleNumber, bomRevision: rev.revision, status: short ? "PARTIAL" : "READY", createdBy: user.id, createdByName: user.name,
@@ -73,13 +94,20 @@ async function issue(user, id) {
   if (kit.status === "ISSUED" || kit.status === "CANCELLED") throw new BusinessError("KIT_CLOSED", `Kit is ${kit.status}.`);
   const wip = await findSpecial("WIP");
   return atomic(async (ctx) => {
-    const res = await Reservation.find({ kit: kit._id, status: "ACTIVE" });
+    await ctx.lock(Kit, kit._id);
+    const freshKit = await Kit.findById(kit._id, null, ctx.opt).lean();
+    if (!freshKit || ["ISSUED", "CANCELLED"].includes(freshKit.status)) throw new BusinessError("KIT_CLOSED", `Kit is ${freshKit ? freshKit.status : "missing"}.`);
+    const reservationQuery = Reservation.find({ kit: kit._id, status: "ACTIVE" });
+    if (ctx.session) reservationQuery.session(ctx.session);
+    const res = await reservationQuery;
     if (!res.length) throw new BusinessError("KIT_EMPTY", "Nothing is reserved on this kit.");
     for (const r of res) {
-      const item = await MaterialItem.findById(r.materialItem);
+      const item = await MaterialItem.findById(r.materialItem, null, ctx.opt);
       if (item.status !== MS.APPROVED) throw new BusinessError("MATERIAL_NOT_APPROVED", `${item.partNumber} ${item.serialNumber || item.batchNumber} is ${item.status}; recreate the kit.`);
       let left = r.quantity;
-      const bal = (await StockBalance.find({ materialItem: item._id, quantity: { $gt: 0 } }).populate("location", "type").lean()).filter((b) => b.location.type === "BIN");
+      const balanceQuery = StockBalance.find({ materialItem: item._id, quantity: { $gt: 0 } }).populate("location", "type");
+      if (ctx.session) balanceQuery.session(ctx.session);
+      const bal = (await balanceQuery.lean()).filter((b) => b.location.type === "BIN");
       for (const b of bal) {
         if (left <= 0) break; const take = Math.min(left, b.quantity);
         await ledger.post(ctx, user, { type: "ISSUE", item, qty: take, from: b.location._id, to: wip._id, fromStatus: item.status, toStatus: item.status, reason: `Kit ${kit.kitId} for ${kit.vehicleNumber}`, refType: "Kit", refId: kit.kitId });
@@ -99,7 +127,12 @@ async function cancel(user, id, reason) {
   const { kit } = await detail(id);
   if (["ISSUED", "CANCELLED"].includes(kit.status)) throw new BusinessError("KIT_CLOSED", `Kit is ${kit.status}.`);
   return atomic(async (ctx) => {
-    for (const r of await Reservation.find({ kit: kit._id, status: "ACTIVE" })) await ctx.set(Reservation, r._id, { status: "RELEASED" });
+    await ctx.lock(Kit, kit._id);
+    const freshKit = await Kit.findById(kit._id, null, ctx.opt).lean();
+    if (!freshKit || ["ISSUED", "CANCELLED"].includes(freshKit.status)) throw new BusinessError("KIT_CLOSED", `Kit is ${freshKit ? freshKit.status : "missing"}.`);
+    const reservationQuery = Reservation.find({ kit: kit._id, status: "ACTIVE" });
+    if (ctx.session) reservationQuery.session(ctx.session);
+    for (const r of await reservationQuery) await ctx.set(Reservation, r._id, { status: "RELEASED" });
     await ctx.set(Kit, kit._id, { status: "CANCELLED" });
     await audit(ctx, user, { action: "KIT_CANCELLED", entityType: "Kit", entityId: kit._id, entityLabel: kit.kitId, reason });
     return { ok: true };

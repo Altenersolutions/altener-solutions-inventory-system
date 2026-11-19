@@ -10,9 +10,11 @@ const { wrap, validate, authenticate, requirePerm } = require("../middleware/com
 const { permissionsFor, P } = require("../domain/permissions");
 const { BusinessError } = require("../domain/errors");
 const { AuditLog } = require("../models");
+const { sharedStore } = require("../middleware/rateLimitStore");
 
 const esc = (t) => String(t).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-const loginLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: Number(process.env.LOGIN_RATE_LIMIT || 30), standardHeaders: true, legacyHeaders: false, message: { message: "Too many login attempts. Try again later." } });
+const loginWindowMs = 15 * 60 * 1000;
+const loginLimiter = rateLimit({ windowMs: loginWindowMs, limit: Number(process.env.LOGIN_RATE_LIMIT || 30), standardHeaders: true, legacyHeaders: false, store: sharedStore({ prefix: "wms:login", windowMs: loginWindowMs }), message: { message: "Too many login attempts. Try again later." } });
 
 const safeEq = (a, b) => { const A = Buffer.from(String(a)), B = Buffer.from(String(b)); return A.length === B.length && crypto.timingSafeEqual(A, B); };
 const strongPw = z.string().min(8, "Password must be at least 8 characters").max(128).regex(/[A-Za-z]/, "Password must contain a letter").regex(/\d/, "Password must contain a digit");
@@ -41,8 +43,14 @@ const loginHandler = wrap(async (req, res) => {
   if (user && user.lockUntil && user.lockUntil > new Date()) return res.status(423).json({ message: `Account temporarily locked after repeated failed sign-ins. Try again in ${Math.ceil((user.lockUntil - Date.now()) / 60000)} minute(s).` });
   if (!user || user.active === false || !(await verifyPassword(user, password))) {
     if (user && user.active !== false) { // count failures per account (the IP limiter alone does not stop a slow guessing attack)
-      const n = (user.failedLogins || 0) + 1;
-      await User.updateOne({ _id: user._id }, n >= config.maxFailedLogins ? { $set: { failedLogins: 0, lockUntil: new Date(Date.now() + config.lockMinutes * 60000) } } : { $set: { failedLogins: n } });
+      const lockUntil = new Date(Date.now() + config.lockMinutes * 60000);
+      await User.updateOne({ _id: user._id }, [
+        { $set: { failedLogins: { $add: [{ $ifNull: ["$failedLogins", 0] }, 1] } } },
+        { $set: {
+          failedLogins: { $cond: [{ $gte: ["$failedLogins", config.maxFailedLogins] }, 0, "$failedLogins"] },
+          lockUntil: { $cond: [{ $gte: ["$failedLogins", config.maxFailedLogins] }, lockUntil, "$lockUntil"] },
+        } },
+      ]);
     }
     return res.status(401).json({ message: "Invalid email or password" });
   }

@@ -58,10 +58,10 @@ r.post("/eco/:id/reject", requirePerm(P.ENG_APPROVE), validate(z.object({ note: 
 
 // ---- kits ----
 r.get("/kits", requirePerm(P.INV_VIEW, P.ASM_VIEW), wrap(async (req, res) => res.json(await M.Kit.find(req.query.status ? { status: String(req.query.status) } : {}).sort({ createdAt: -1 }).limit(300).lean())));
-r.post("/kits", requirePerm(P.RESERVE), validate(z.object({ vehicle: rq(60), allowPartial: z.boolean().optional(), includeOptional: z.boolean().optional() })), wrap(async (req, res) => res.status(201).json(await kitting.create(req.user, req.body))));
+r.post("/kits", requirePerm(P.RESERVE), idempotent(), validate(z.object({ vehicle: rq(60), allowPartial: z.boolean().optional(), includeOptional: z.boolean().optional() })), wrap(async (req, res) => res.status(201).json(await kitting.create(req.user, req.body))));
 r.get("/kits/:id", requirePerm(P.INV_VIEW, P.ASM_VIEW), wrap(async (req, res) => res.json(await kitting.detail(req.params.id))));
-r.post("/kits/:id/issue", requirePerm(P.ISSUE), wrap(async (req, res) => res.json(await kitting.issue(req.user, req.params.id))));
-r.post("/kits/:id/cancel", requirePerm(P.RESERVE), validate(z.object({ reason: rq(300) })), wrap(async (req, res) => res.json(await kitting.cancel(req.user, req.params.id, req.body.reason))));
+r.post("/kits/:id/issue", requirePerm(P.ISSUE), idempotent(), wrap(async (req, res) => res.json(await kitting.issue(req.user, req.params.id))));
+r.post("/kits/:id/cancel", requirePerm(P.RESERVE), idempotent(), validate(z.object({ reason: rq(300) })), wrap(async (req, res) => res.json(await kitting.cancel(req.user, req.params.id, req.body.reason))));
 
 // ---- cycle counts ----
 r.get("/counts", requirePerm(P.INV_VIEW), wrap(async (req, res) => res.json(await M.CycleCount.find().sort({ createdAt: -1 }).limit(200).lean())));

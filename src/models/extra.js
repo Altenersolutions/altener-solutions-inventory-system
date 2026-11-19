@@ -90,7 +90,7 @@ module.exports = { QcTemplate, PurchaseOrder, Reservation, Kit, CycleCount, Ncr,
 
 // One row per "submit" the browser sent: a double click or a retry returns the first answer instead of doing the work twice.
 const IdempotencyKey = mongoose.model("WmsIdempotencyKey", new mongoose.Schema({
-  key: { type: String, required: true, unique: true }, user: String, route: String,
+  key: { type: String, required: true, unique: true }, user: String, route: String, requestHash: String,
   state: { type: String, enum: ["IN_PROGRESS", "DONE"], default: "IN_PROGRESS" }, status: Number, body: mongoose.Schema.Types.Mixed,
   createdAt: { type: Date, default: Date.now, expires: 86400 },        // forgotten after a day
 }));

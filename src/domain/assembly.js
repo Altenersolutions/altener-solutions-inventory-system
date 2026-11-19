@@ -149,7 +149,7 @@ async function install(user, body) {
     if (!freshVeh || CLOSED.includes(freshVeh.status)) throw new BusinessError("VEHICLE_CLOSED", `Vehicle ${vehicle.vehicleNumber} is ${freshVeh ? freshVeh.status : "missing"} and cannot be modified.`);
     if (from && from.type === "BIN" && !item.installedOn && !overridesUsed.some((e) => e.code === "RESERVED_STOCK")) { // re-check reservations under a lock (see uow.lock)
       await ctx.lock(MaterialItem, item._id);
-      const r2 = await reservedQty(item._id), f2 = (await binQty(item._id)) - r2;
+      const r2 = await reservedQty(item._id, null, ctx.session), f2 = (await binQty(item._id, ctx.session)) - r2;
       if (r2 > 0 && qty > f2) throw new BusinessError("RESERVED_STOCK", `Only ${Math.max(0, f2)} unit(s) are free; the rest is reserved for a kit. Use the kit instead.`, { details: { free: f2 } });
     }
     const vehicleLoc = await findSpecial("VEHICLE");

@@ -10,6 +10,12 @@ const PW = "ChangeMe#2026"; let app, token, supA, supB; const stamp = Date.now()
 const api = (m, u, b, h = {}) => { let r = request(app)[m](u).set("Authorization", `Bearer ${token}`); for (const [k, v] of Object.entries(h)) r = r.set(k, v); return b ? r.send(b) : r; };
 const uid = (p) => `${p}-${stamp % 100000}-${++n}`;
 const mkPart = async (partNumber, extra = {}) => { const r = await api("post", "/api/parts", { partName: `Part ${partNumber}`, category: "ELECTRICAL", trackingType: "BATCH", partNumber, ...extra }); assert.equal(r.status, 201, JSON.stringify(r.body)); return r.body; };
+const invoiceFile = async () => {
+  const data = Buffer.from("%PDF-1.4\n% idempotency test\n%%EOF\n");
+  const upload = await api("post", "/api/files", { name: "invoice.pdf", mime: "application/pdf", purpose: "INVOICE", dataBase64: data.toString("base64") });
+  assert.equal(upload.status, 201, JSON.stringify(upload.body));
+  return upload.body.id;
+};
 const ovr = { reason: "approved by store head", confirm: true };
 const recBody = (sup, inv, part, batch, qty = 10) => ({ supplierId: String(sup._id), invoiceNo: inv, lines: [{ partNumber: part, quantity: qty, batchNumber: batch }] });
 
@@ -38,14 +44,17 @@ test("duplicate receipts: the same invoice from another supplier is fine; an app
 });
 test("idempotency key: a repeated submit returns the first answer and does the work once; a failed attempt can be retried with the same key", async () => {
   const pn = uid("IDEM"); await mkPart(pn); const inv = uid("INV"); const key = `key-${stamp}-${n}`;
-  const first = await api("post", "/api/receiving", recBody(supA, inv, pn, "I1"), { "Idempotency-Key": key }); assert.equal(first.status, 201);
-  const again = await api("post", "/api/receiving", recBody(supA, inv, pn, "I1"), { "Idempotency-Key": key });
+  const firstBody = { ...recBody(supA, inv, pn, "I1"), invoiceFileId: await invoiceFile() };
+  const first = await api("post", "/api/receiving", firstBody, { "Idempotency-Key": key }); assert.equal(first.status, 201);
+  const again = await api("post", "/api/receiving", firstBody, { "Idempotency-Key": key });
   assert.equal(again.status, 201); assert.equal(again.headers["idempotent-replay"], "true"); assert.equal(again.body.receiptNo, first.body.receiptNo);
   assert.equal(await M.Receipt.countDocuments({ invoiceNo: inv }), 1);
   // a 409 is not remembered: same key + override works
   const inv2 = uid("INV"); await api("post", "/api/receiving", recBody(supA, inv2, pn, "I2")); const key2 = `key2-${stamp}-${n}`;
-  const blocked = await api("post", "/api/receiving", recBody(supA, inv2, pn, "I3"), { "Idempotency-Key": key2 }); assert.equal(blocked.status, 409);
-  const retry = await api("post", "/api/receiving", { ...recBody(supA, inv2, pn, "I3"), override: ovr }, { "Idempotency-Key": key2 }); assert.equal(retry.status, 201, JSON.stringify(retry.body));
+  const blockedBody = { ...recBody(supA, inv2, pn, "I3"), invoiceFileId: await invoiceFile() };
+  const blocked = await api("post", "/api/receiving", blockedBody, { "Idempotency-Key": key2 }); assert.equal(blocked.status, 409);
+  assert.equal(await M.IdempotencyKey.countDocuments({ key: new RegExp(`${key2}$`) }), 0, "failed responses must release their idempotency key");
+  const retry = await api("post", "/api/receiving", { ...blockedBody, override: ovr }, { "Idempotency-Key": key2 }); assert.equal(retry.status, 201, JSON.stringify(retry.body));
   assert.equal((await api("post", "/api/receiving", recBody(supA, uid("INV"), pn, "I9"), { "Idempotency-Key": "bad key!" })).status, 400);
 });
 test("simultaneous receipts against one PO never exceed it", async () => {

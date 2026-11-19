@@ -5,7 +5,7 @@ const express = require("express");
 const L = require("../models/legacy");
 const { AuditLog } = require("../models");
 const { wrap, requirePerm } = require("../middleware/common");
-const { P, canAny } = require("../domain/permissions");
+const { P, can, canAny } = require("../domain/permissions");
 const gatepass = require("../domain/gatepass");
 const { norm } = require("../domain/permissions");
 
@@ -41,6 +41,19 @@ r.use((req, res, next) => {
 
 const ok500 = (res) => res.status(500).json({ message: "Server error" });
 
+function legacyLimit(req) {
+  const skip = Math.max(0, parseInt(req.query.skip, 10) || 0);
+  const limit = Math.min(Math.max(1, parseInt(req.query.limit, 10) || 500), 1000);
+  return { skip, limit };
+}
+async function legacyList(req, res, Model, query = {}, sort = { createdAt: -1 }) {
+  const { skip, limit } = legacyLimit(req);
+  res.set("X-Total-Count", String(await Model.countDocuments(query)));
+  res.set("X-Skip", String(skip));
+  res.set("X-Limit", String(limit));
+  return res.json(await Model.find(query).sort(sort).skip(skip).limit(limit).lean());
+}
+
 function crud(Model, { list, create = "/", update, del, hasDupCheck = true }) {
   return { Model };
 }
@@ -52,7 +65,7 @@ function registerSimple(name, Model, { listAll }) {
     const query = listAll ? (catagory ? { catagory: String(catagory) } : {}) : { catagory: catagory === undefined ? undefined : String(catagory) };
     if (query.catagory === undefined) delete query.catagory;
     if (vehicle) query.vehicles = String(vehicle).toUpperCase();
-    res.json(await Model.find(query));
+    await legacyList(req, res, Model, query);
   }));
   r.post(`/${name}`, wrap(async (req, res) => {
     const { partId } = req.body;
@@ -75,7 +88,11 @@ function registerSimple(name, Model, { listAll }) {
 // only fields declared in the schema (blocks operator injection / mass assignment of _id, __v)
 function pick(body, Model) {
   const out = {}; const paths = Object.keys(Model.schema.paths).filter((p) => !["_id", "__v"].includes(p));
-  for (const k of paths) if (body && body[k] !== undefined && typeof body[k] !== "object" || (body && Array.isArray(body[k]))) out[k] = body[k];
+  for (const k of paths) {
+    if (body && body[k] !== undefined && (typeof body[k] !== "object" || Array.isArray(body[k]))) {
+      out[k] = body[k];
+    }
+  }
   return out;
 }
 registerSimple("bom", L.Bom, { listAll: true });
@@ -91,7 +108,7 @@ r.get("/getparts", wrap(async (req, res) => {
   const { catagory, vehicle } = req.query; const q = {};
   if (catagory && catagory !== "all") q.catagory = String(catagory);
   if (vehicle) q.vehicles = String(vehicle).toUpperCase();
-  res.json(await L.Parts.find(q));
+  await legacyList(req, res, L.Parts, q, { partId: 1 });
 }));
 r.get("/getpartsby-part-id", wrap(async (req, res) => res.json(await L.Parts.findOne({ partId: String(req.query.partId) }))));
 r.post("/parts", wrap(async (req, res) => {
@@ -132,7 +149,7 @@ r.delete("/deleteparts", wrap(async (req, res) => {
 }));
 
 // ---- Parts I/O ----
-r.get("/getpartsIO", wrap(async (req, res) => res.json(await L.PartsIO.find())));
+r.get("/getpartsIO", wrap(async (req, res) => legacyList(req, res, L.PartsIO, {})));
 r.post("/partsIO", wrap(async (req, res) => { const d = new L.PartsIO(pick(req.body, L.PartsIO)); await d.save(); res.status(201).json(d); }));
 r.put("/partsIO/:id", wrap(async (req, res) => { const d = await L.PartsIO.findByIdAndUpdate(req.params.id, pick(req.body, L.PartsIO), { new: true }); return d ? res.json({ updatedPartIO: d }) : res.status(404).json({ message: "PartsIO record not found" }); }));
 r.put("/updatePartId", wrap(async (req, res) => {
@@ -147,7 +164,7 @@ r.put("/updatePartId", wrap(async (req, res) => {
 r.delete("/deletepartsIO", wrap(async (req, res) => { const { _id } = req.query; if (!_id) return res.status(400).json({ message: "part ID is required" }); const d = await L.PartsIO.findOneAndDelete({ _id: String(_id) }); return d ? res.json({ message: "part deleted" }) : res.status(404).json({ message: "part not found" }); }));
 
 // ---- Incoming (legacy). New receiving must use /api/receiving; this keeps old screens readable/editable.
-r.get("/getIncomming", wrap(async (req, res) => { const q = req.query.vehicle ? { vehicles: String(req.query.vehicle).toUpperCase() } : {}; res.json(await L.Incomming.find(q)); }));
+r.get("/getIncomming", wrap(async (req, res) => { const q = req.query.vehicle ? { vehicles: String(req.query.vehicle).toUpperCase() } : {}; await legacyList(req, res, L.Incomming, q); }));
 r.post("/Incomming", wrap(async (req, res) => {
   // The mandatory-invoice rule applies to legacy incoming records as well (server-side).
   if (!String(req.body.invoice || "").trim()) return res.status(400).json({ error: "INVOICE_REQUIRED", message: "Invoice number is mandatory before material can be received." });
@@ -162,17 +179,33 @@ r.put("/Incomming/:id", wrap(async (req, res) => {
 r.delete("/deleteIncomming", wrap(async (req, res) => { const { _id } = req.query; if (!_id) return res.status(400).json({ message: "part ID is required" }); const d = await L.Incomming.findOneAndDelete({ _id: String(_id) }); return d ? res.json({ message: "part deleted" }) : res.status(404).json({ message: "part not found" }); }));
 
 // ---- Notifications ----
-r.get("/notifications", wrap(async (req, res) => { const { dept } = req.query; res.json(dept === "Admin" ? await L.Msg.find() : await L.Msg.find({ to: String(dept) })); }));
+const NOTIFICATION_DEPARTMENT = {
+  "store assistant": "Store",
+  "purchase executive": "Purchase",
+  qc: "QC",
+  assembly: "Assembly",
+  engineer: "Engineering",
+};
+r.get("/notifications", wrap(async (req, res) => {
+  const canViewAll = await can(req.user.role, P.ADMIN_USERS);
+  if (canViewAll) {
+    const dept = String(req.query.dept || "");
+    return legacyList(req, res, L.Msg, dept && dept !== "Admin" ? { to: dept } : {});
+  }
+  const role = norm(req.user.role);
+  const dept = NOTIFICATION_DEPARTMENT[role] || req.user.role;
+  return legacyList(req, res, L.Msg, { to: new RegExp(`^${String(dept).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i") });
+}));
 r.post("/notifications", wrap(async (req, res) => { const m = new L.Msg(pick(req.body, L.Msg)); await m.save(); res.status(201).json(m); }));
 
 // ---- Gate pass (same InventoryGatePass collection, now under gatepass.* permissions) / legacy activity log (audit.view) ----
 r.get("/gatepass/next-ref", requirePerm(P.GP_CREATE), wrap(async (req, res) => res.json({ refNo: await gatepass.nextRef() })));
-r.get("/gatepass", requirePerm(P.GP_VIEW), wrap(async (req, res) => res.json(await L.GatePass.find().sort({ createdAt: -1 }))));
+r.get("/gatepass", requirePerm(P.GP_VIEW), wrap(async (req, res) => legacyList(req, res, L.GatePass, {})));
 r.post("/gatepass", requirePerm(P.GP_CREATE), wrap(async (req, res) => {
   const b = req.body || {};
   const items = (b.items || []).map((i) => ({ name: i.name, partNumber: i.partNumber, serialBatch: i.serialBatch, qty: String(i.qty ?? ""), uom: i.uom, vehicleNumber: i.vehicleNumber }));
   res.status(201).json(await gatepass.create(req.user, { date: b.date, supplier: b.supplier, dispatchMode: b.dispatchMode, returnable: !!b.returnable, returnDate: b.returnDate, remarks: b.remarks, issuedBy: b.issuedBy, receivedBy: b.receivedBy, items }));
 }));
-r.get("/activity-log", requirePerm(P.AUDIT), wrap(async (req, res) => res.json(await L.ActivityLog.find().sort({ createdAt: -1 }).limit(500))));
+r.get("/activity-log", requirePerm(P.AUDIT), wrap(async (req, res) => legacyList(req, res, L.ActivityLog, {})));
 
 module.exports = r;

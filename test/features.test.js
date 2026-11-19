@@ -120,6 +120,18 @@ test("kitting: shortage blocked, FIFO reservation, reserved stock protected, kit
   assert.equal(await M.Reservation.countDocuments({ kit: k2.body._id, status: "ACTIVE" }), 0);
 });
 
+test("parallel kit creation leaves at most one open kit per vehicle", async (t) => {
+  if (!db.supportsTransactions()) return t.skip("requires MongoDB transactions");
+  const vehicle = await api("post", "/api/vehicles", "engineer", { vehicleNumber: "KIT-RACE-1", model: "RETROFIT", vehicleType: "RETROFIT" });
+  assert.equal(vehicle.status, 201, JSON.stringify(vehicle.body));
+  const results = await Promise.all([
+    api("post", "/api/kits", "store", { vehicle: "KIT-RACE-1", allowPartial: true }),
+    api("post", "/api/kits", "store", { vehicle: "KIT-RACE-1", allowPartial: true }),
+  ]);
+  assert.deepEqual(results.map((result) => result.status).sort(), [201, 409]);
+  assert.equal(await M.Kit.countDocuments({ vehicle: vehicle.body._id, status: { $in: ["READY", "PARTIAL"] } }), 1);
+});
+
 test("cycle count: variances need approval, adjustment posted with audit, stale counts rejected, only admin approves", async () => {
   const it = await stored("NOFIFO-1", { quantity: 10, batchNumber: "B-CC" });
   const c = await api("post", "/api/counts", "store", { location: "E-12" }); assert.equal(c.status, 201, JSON.stringify(c.body));

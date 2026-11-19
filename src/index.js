@@ -3,6 +3,7 @@ const config = require("./config");
 const db = require("./db");
 const { createApp } = require("./app");
 const { ensureBaseData } = require("./scripts/baseData");
+const { closeRateLimitStores } = require("./middleware/rateLimitStore");
 
 let server;
 const log = (level, msg, extra) => console[level === "error" ? "error" : "log"](JSON.stringify({ t: new Date().toISOString(), level, msg, ...extra }));
@@ -15,6 +16,7 @@ async function shutdown(signal) {
   const force = setTimeout(() => { log("error", "forced exit after 25s"); process.exit(1); }, 25000); force.unref();
   try {
     if (server) await new Promise((resolve) => server.close(resolve));
+    closeRateLimitStores();
     await mongoose.connection.close();
     log("info", "shutdown complete"); process.exit(0);
   } catch (e) { log("error", "shutdown failed", { error: e.message }); process.exit(1); }

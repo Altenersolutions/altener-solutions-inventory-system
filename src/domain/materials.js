@@ -328,7 +328,7 @@ async function issue(user, body) {
   return atomic(async (ctx) => {
     if (resv > 0 || (await reservedQty(item._id)) > 0) { // re-check under a lock: two issues cannot both take the last free units
       await ctx.lock(MaterialItem, item._id);
-      const r2 = await reservedQty(item._id), f2 = (await binQty(item._id)) - r2;
+      const r2 = await reservedQty(item._id, null, ctx.session), f2 = (await binQty(item._id, ctx.session)) - r2;
       if (r2 > 0 && qty > f2) throw new BusinessError("RESERVED_STOCK", `${Math.max(0, f2)} unit(s) are free; the rest is reserved for a kit. Issue the kit instead.`, { details: { free: f2 } });
     }
     const txn = await ledger.post(ctx, user, { type: "ISSUE", item, qty, from: from._id, to: wip._id, fromStatus: item.status, toStatus: item.status, reason: fifoErr ? `FIFO OVERRIDE: ${body.override.reason} | ${body.purpose}` : body.purpose, refType: "Issue", override: !!fifoErr });

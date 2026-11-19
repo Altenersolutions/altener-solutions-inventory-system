@@ -220,8 +220,12 @@ Roles saved in the database replace these defaults; **a newly added permission i
 
 ## 12. For developers
 
-* Run locally: `npm install`, then `npm run dev` (needs MongoDB, default `mongodb://127.0.0.1:27017/inventory`).
-* Tests: `npm test` (needs a MongoDB on 127.0.0.1:27017; it creates and drops its own test databases).
+* Run locally with Node 20: `npm install`, `npm run mongo:start`, then `npm run dev`.
+* Docker starts MongoDB as a replica set on `mongodb://127.0.0.1:27017/inventory`.
+* Optional shared rate limiting: set `REDIS_URL=redis://127.0.0.1:6379` and run `docker compose up -d redis`.
+* Unit tests: `npm run test:unit`.
+* Integration tests: `npm run mongo:start`, then `npm run test:integration`.
+* Full test suite: `npm test`.
 * Commands: `npm run docs` (regenerate `docs/API.md`), `npm run reconcile` (balances vs ledger check), `npm run load:assets` (load the capital assets register), `npm run cleanup:bom` (one-time removal of temporary data).
 * Layout: `src/domain` (business rules: the important part), `src/routes` (HTTP endpoints and permission checks), `src/models` (database schemas), `src/scripts` (maintenance commands), `test` (automated tests), `docs` (API list, deployment guide).
 * Rule for changes: put every business rule in `src/domain` and the permission check in the route. Never rely on the screen alone.

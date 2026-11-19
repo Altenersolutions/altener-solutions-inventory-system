@@ -1,5 +1,13 @@
 # Release 1.0.0 (Version 1)
 
+## Project hardening updates
+- Replaced vulnerable transitive dependencies; `npm audit` now reports zero vulnerabilities.
+- Added Node 20–24 engine guidance and Docker-based MongoDB replica-set scripts.
+- Added unit/integration test commands.
+- Added Redis-backed shared API/login rate limiting when `REDIS_URL` is configured.
+- Added pagination and total-count headers to legacy list endpoints.
+- Improved legacy mass-assignment filtering and backup verification with automatic collection-count checks.
+
 Version numbers: package.json (`1.0.0`) is the single source; the API reports it at `GET /api/version`, the frontend shows it in the sidebar
 (`config.js` -> `WMS_VERSION`) and warns if the MAJOR numbers differ. Nothing bumps it automatically. Database migrations are independent of it.
 

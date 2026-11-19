@@ -1,4 +1,5 @@
 const jwt = require("jsonwebtoken");
+const crypto = require("crypto");
 const { ZodError } = require("zod");
 const config = require("../config");
 const { User } = require("../models");
@@ -50,14 +51,35 @@ const idempotent = () => wrap(async (req, res, next) => {
   const key = req.get("Idempotency-Key"); if (!key) return next();
   if (!/^[\w.-]{8,100}$/.test(key)) return res.status(400).json({ error: "BAD_IDEMPOTENCY_KEY", message: "Idempotency-Key must be 8-100 letters, digits, dash or underscore." });
   const { IdempotencyKey } = require("../models"); const id = `${req.user.id}:${req.method}:${req.baseUrl || ""}${req.path}:${key}`;
-  try { await IdempotencyKey.create({ key: id, user: String(req.user.id), route: req.originalUrl }); }
+  const canonical = (value) => {
+    if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
+    if (value && typeof value === "object") return `{${Object.keys(value).sort().map((name) => `${JSON.stringify(name)}:${canonical(value[name])}`).join(",")}}`;
+    return JSON.stringify(value);
+  };
+  const parsedBody = req.rawBody && req.rawBody.trim() ? JSON.parse(req.rawBody) : req.body ?? null;
+  const requestHash = crypto.createHash("sha256").update(canonical(parsedBody)).digest("hex");
+  try { await IdempotencyKey.create({ key: id, user: String(req.user.id), route: req.originalUrl, requestHash }); }
   catch (e) {
     if (e.code !== 11000) throw e; const rec = await IdempotencyKey.findOne({ key: id }).lean();
+    if (rec && rec.requestHash !== requestHash) return res.status(409).json({ error: "IDEMPOTENCY_KEY_REUSED", message: "This Idempotency-Key was already used with a different request body. Use a new key." });
     if (rec && rec.state === "DONE") { res.set("Idempotent-Replay", "true"); return res.status(rec.status).json(rec.body); }
     return res.status(409).json({ error: "REQUEST_IN_PROGRESS", message: "This request is already being processed. Wait a moment and do not submit it again." });
   }
   const send = res.json.bind(res);
-  res.json = (body) => { const ok = res.statusCode >= 200 && res.statusCode < 300; const done = ok ? IdempotencyKey.updateOne({ key: id }, { state: "DONE", status: res.statusCode, body: JSON.parse(JSON.stringify(body === undefined ? null : body)) }) : IdempotencyKey.deleteOne({ key: id }); done.then(() => send(body), () => send(body)); return res; };
+  res.json = (body) => {
+    const ok = res.statusCode >= 200 && res.statusCode < 300;
+    const done = ok
+      ? IdempotencyKey.updateOne({ key: id }, { state: "DONE", status: res.statusCode, body: JSON.parse(JSON.stringify(body === undefined ? null : body)) })
+      : IdempotencyKey.deleteOne({ key: id });
+    done.then((result) => {
+      if (ok && result.matchedCount !== 1) throw new Error("Could not persist the idempotency response.");
+      send(body);
+    }).catch((err) => {
+      res.json = send;
+      next(err);
+    });
+    return res;
+  };
   next();
 });
 // Request id + one access-log line per request (JSON, no extra dependency). Skips the health probes.

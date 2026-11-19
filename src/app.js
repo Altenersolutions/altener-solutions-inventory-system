@@ -14,17 +14,36 @@ const extra = require("./routes/extra");
 const assetsRoutes = require("./routes/assets");
 const legacyRoutes = require("./legacy/routes");
 const legacyActivity = require("./legacy/activityLog");
+const { sharedStore } = require("./middleware/rateLimitStore");
 
 function createApp() {
   const app = express();
   app.set("trust proxy", 1);
   app.use(requestLog);
-  app.use(helmet({ contentSecurityPolicy: false, crossOriginEmbedderPolicy: false }));
+  app.use(helmet({
+    crossOriginEmbedderPolicy: false,
+    contentSecurityPolicy: {
+      useDefaults: false,
+      directives: {
+        defaultSrc: ["'self'"],
+        baseUri: ["'self'"],
+        connectSrc: ["'self'"],
+        fontSrc: ["'self'", "data:"],
+        formAction: ["'self'"],
+        frameAncestors: ["'none'"],
+        imgSrc: ["'self'", "data:", "blob:"],
+        mediaSrc: ["'self'", "blob:"],
+        objectSrc: ["'none'"],
+        scriptSrc: ["'self'"],
+        styleSrc: ["'self'", "'unsafe-inline'"],
+      },
+    },
+  }));
   const corsBase = { exposedHeaders: ["X-Total-Count", "Content-Disposition"] };
   app.use(cors(config.corsOrigins.length ? { ...corsBase, origin: config.corsOrigins } : { ...corsBase, origin: !config.isProd }));
   app.use("/api/files", express.json({ limit: "8mb" })); // document / invoice uploads (base64)
-  app.use(express.json({ limit: "1500kb" }));
-  app.use(rateLimit({ windowMs: 60 * 1000, limit: Number(process.env.RATE_LIMIT || 900), standardHeaders: true, legacyHeaders: false }));
+  app.use(express.json({ limit: "1500kb", verify: (req, res, buf) => { req.rawBody = buf.toString("utf8"); } }));
+  app.use(rateLimit({ windowMs: 60 * 1000, limit: Number(process.env.RATE_LIMIT || 900), standardHeaders: true, legacyHeaders: false, store: sharedStore({ prefix: "wms:api", windowMs: 60 * 1000 }) }));
 
   // ---- public ----
   app.get("/api/health", (req, res) => res.json({ ok: true, version: appVersion.version }));

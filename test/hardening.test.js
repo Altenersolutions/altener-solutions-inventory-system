@@ -55,7 +55,8 @@ test("H2 permission denied is still 403 (not confused with an expired session)",
 
 test("H3 account locks after repeated wrong passwords, even for the right password", async () => {
   assert.equal((await api("post", "/api/users", "admin", { name: "Lock Me", emailId: "lockme@example.com", role: "store", password: PW })).status, 201);
-  for (let i = 0; i < config.maxFailedLogins; i++) assert.equal((await login("lockme@example.com", "WrongPass1")).status, 401); // config is loaded by the test preload, so read the real limit
+  const failures = await Promise.all(Array.from({ length: config.maxFailedLogins }, () => login("lockme@example.com", "WrongPass1")));
+  assert.ok(failures.every((response) => response.status === 401));
   assert.equal((await login("lockme@example.com")).status, 423);
 });
 
@@ -89,8 +90,26 @@ test("H7 same Idempotency-Key on an issue moves stock once and replays the first
   const a = await api("post", "/api/inventory/issue", "store", body, h);
   const b = await api("post", "/api/inventory/issue", "store", body, h);
   assert.equal(a.status, 200); assert.equal(b.status, 200); assert.equal(b.headers["idempotent-replay"], "true");
+  const changed = await api("post", "/api/inventory/issue", "store", { ...body, quantity: 6 }, h);
+  assert.equal(changed.status, 409);
+  assert.equal(changed.body.error, "IDEMPOTENCY_KEY_REUSED");
   assert.equal(await balance(it.id, "E-12"), 15);
   assert.equal(await M.InventoryTransaction.countDocuments({ materialItem: it.id, transactionType: "ISSUE" }), 1);
+});
+
+test("legacy notifications stay within the authenticated user's department", async () => {
+  const ownSubject = `notification-store-${stamp}`;
+  const otherSubject = `notification-admin-${stamp}`;
+  await M.Msg.create([
+    { to: "Store", subject: ownSubject, date: new Date(), description: "Store-only notice" },
+    { to: "Admin", subject: otherSubject, date: new Date(), description: "Admin-only notice" },
+  ]);
+  const response = await api("get", "/notifications?dept=Admin", "store");
+  assert.equal(response.status, 200);
+  assert.ok(response.body.some((message) => message.subject === ownSubject));
+  assert.ok(!response.body.some((message) => message.subject === otherSubject));
+  const adminResponse = await api("get", "/notifications?dept=Admin", "admin");
+  assert.ok(adminResponse.body.some((message) => message.subject === otherSubject));
 });
 
 test("H8 concurrent issues never drive stock negative and the ledger matches balances", async () => {
@@ -104,7 +123,9 @@ test("H8 concurrent issues never drive stock negative and the ledger matches bal
 });
 
 test("H9 health and readiness probes", async () => {
-  assert.equal((await request(app).get("/api/health")).status, 200);
+  const health = await request(app).get("/api/health");
+  assert.equal(health.status, 200);
+  assert.match(health.headers["content-security-policy"], /default-src 'self'/);
   const r = await request(app).get("/api/ready"); assert.equal(r.status, 200); assert.equal(r.body.db, "connected");
 });
 

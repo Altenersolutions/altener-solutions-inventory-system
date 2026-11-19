@@ -44,7 +44,7 @@ async function create(user, body) {
   return atomic(async (ctx) => {
     for (const p of prepared) if (p.from.type === "BIN") { // re-check reservations under a lock (see uow.lock)
       await ctx.lock(MaterialItem, p.item._id);
-      const r2 = await reservedQty(p.item._id), f2 = (await binQty(p.item._id)) - r2;
+      const r2 = await reservedQty(p.item._id, null, ctx.session), f2 = (await binQty(p.item._id, ctx.session)) - r2;
       if (r2 > 0 && p.qty > f2) throw new BusinessError("RESERVED_STOCK", `${Math.max(0, f2)} unit(s) are free; the rest is reserved for a kit.`, { details: { free: f2 } });
     }
     const groupId = prepared.length > 1 ? await nextId("handovergroup", "HG", 6) : undefined;
