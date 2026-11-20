@@ -9,7 +9,8 @@ const jwt = require("jsonwebtoken");
 const mongoose = require("mongoose");
 const db = require("../src/db");
 const config = require("../src/config");
-const { createApp } = require("../src/app");
+const appModule = require("../src/app");
+const { createApp } = appModule;
 const { seed } = require("../src/scripts/seed");
 const M = require("../src/models");
 
@@ -28,6 +29,11 @@ before(async () => {
   assert.equal(np.status, 201, JSON.stringify(np.body));
 });
 after(async () => { await mongoose.connection.dropDatabase(); await mongoose.disconnect(); });
+
+test("Express app is exported directly for Vercel and retains its app factory", () => {
+  assert.equal(typeof appModule, "function");
+  assert.equal(typeof appModule.createApp, "function");
+});
 
 async function storedItem(qty) {
   const rc = await api("post", "/api/receiving", "store", { supplierId, invoiceNo: `INV-H-${Math.random().toString(36).slice(2, 9)}`, lines: [{ partNumber: "NOFIFO-H", quantity: qty, batchNumber: "B-H" }] });

@@ -1,5 +1,10 @@
 # Deployment, migration, backup and rollback - Release 1.0.0
 
+## Vercel (serverless Express)
+1. Import the backend repository with the Express preset and repository root as the project root. Leave Build and Output settings at their defaults; use Node.js 24.x (the package supports Node.js 20 through 24).
+2. Set `MONGO_URI`, a strong `JWT_SECRET`, `CORS_ORIGINS` to the frontend origin, `REQUIRE_TRANSACTIONS=true`, and `SERVE_LEGACY=false` in Production. Add `BOOTSTRAP_ADMIN_EMAIL` and `BOOTSTRAP_ADMIN_PASSWORD` only when the database has no users and needs its first administrator. Keep secret values out of the repository.
+3. Vercel uses `src/app.js` as the Express handler. Local and Render startup continue through `src/index.js`. Check `/api/health` after deployment; keep the existing Render service until login and inventory workflows are verified.
+
 ## Before you deploy
 1. **Backup** (always): `mongodump --uri "$MONGO_URI" --gzip --archive=backup-$(date +%F).gz`. Keep it until the release is accepted.
 2. Set environment: `NODE_ENV=production`, `JWT_SECRET` (random, 32+ chars, not the example), `SEED_ON_START=false`, `SERVE_LEGACY` as before.

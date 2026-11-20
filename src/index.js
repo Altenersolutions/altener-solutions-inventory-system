@@ -1,7 +1,7 @@
 const mongoose = require("mongoose");
 const config = require("./config");
 const db = require("./db");
-const { createApp } = require("./app");
+const app = require("./app");
 const { ensureBaseData } = require("./scripts/baseData");
 const { closeRateLimitStores } = require("./middleware/rateLimitStore");
 
@@ -33,7 +33,6 @@ process.on("uncaughtException", (e) => { log("error", "uncaughtException", { err
     if (config.isProd) console.warn("SEED_ON_START is ignored in production: demo data never enters a production database.");
     else await require("./scripts/seed").seed({ quiet: false }); // development only: demo parts and locations (no BOMs, no vehicles)
   }
-  const app = createApp();
   server = app.listen(config.port, () => log("info", `Server running on port ${config.port}`));
   server.keepAliveTimeout = 65000; // longer than Render's proxy idle timeout, avoids sporadic 502s
 })().catch((e) => { console.error("Fatal:", e); process.exit(1); });

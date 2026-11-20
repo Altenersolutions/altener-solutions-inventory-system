@@ -15,10 +15,32 @@ const assetsRoutes = require("./routes/assets");
 const legacyRoutes = require("./legacy/routes");
 const legacyActivity = require("./legacy/activityLog");
 const { sharedStore } = require("./middleware/rateLimitStore");
+const db = require("./db");
+const { ensureBaseData } = require("./scripts/baseData");
+
+let vercelInitialization;
+
+function initializeVercelInstance() {
+  if (!process.env.VERCEL) return null;
+  if (!vercelInitialization) {
+    vercelInitialization = db.connect()
+      .then(() => ensureBaseData())
+      .catch((err) => {
+        vercelInitialization = null;
+        throw err;
+      });
+  }
+  return vercelInitialization;
+}
 
 function createApp() {
   const app = express();
   app.set("trust proxy", 1);
+  app.use((req, res, next) => {
+    const ready = initializeVercelInstance();
+    if (!ready) return next();
+    ready.then(() => next(), next);
+  });
   app.use(requestLog);
   app.use(helmet({
     crossOriginEmbedderPolicy: false,
@@ -87,4 +109,7 @@ function createApp() {
   app.use(errorHandler);
   return app;
 }
-module.exports = { createApp };
+
+const app = createApp();
+app.createApp = createApp;
+module.exports = app;
